@@ -64,7 +64,7 @@ def do_training(data_dir, model_dir, device, image_size, input_size, num_workers
     model = EAST()
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[max_epoch // 2], gamma=0.1)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=max_epoch//2,eta_min=0)
 
     model.train()
     for epoch in range(max_epoch):
