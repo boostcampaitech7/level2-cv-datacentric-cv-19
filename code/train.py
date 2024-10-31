@@ -24,10 +24,10 @@ def parse_args():
                         default=os.environ.get('SM_CHANNEL_TRAIN', 'data'))
     parser.add_argument('--model_dir', type=str, default=os.environ.get('SM_MODEL_DIR',
                                                                         'trained_models'))
-
+    parser.add_argument('--pretrained_path', type=str, default='/data/ephemeral/home/newcode2/code/trained_models/latest_150epoch.pth')  # 추가
     parser.add_argument('--device', default='cuda' if cuda.is_available() else 'cpu')
     parser.add_argument('--num_workers', type=int, default=8)
-
+    parser.add_argument('--epoch_start', type=int, default=151)  # 추가
     parser.add_argument('--image_size', type=int, default=2048)
     parser.add_argument('--input_size', type=int, default=1024)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -67,7 +67,7 @@ def do_training(data_dir, model_dir, device, image_size, input_size, num_workers
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=max_epoch//2,eta_min=0)
 
     model.train()
-    for epoch in range(max_epoch):
+    for epoch in range(epoch_start,max_epoch):
         epoch_loss, epoch_start = 0, time.time()
         with tqdm(total=num_batches) as pbar:
             for img, gt_score_map, gt_geo_map, roi_mask in train_loader:
