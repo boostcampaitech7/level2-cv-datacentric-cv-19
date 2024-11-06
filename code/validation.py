@@ -1,7 +1,6 @@
 import os
 import os.path as osp
 import time
-import math
 from datetime import timedelta
 from argparse import ArgumentParser
 import random
@@ -9,13 +8,16 @@ import json
 
 import torch
 from torch import cuda
-from torch.utils.data import DataLoader, ConcatDataset, random_split
+from torch.utils.data import DataLoader, random_split, ConcatDataset, Subset
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 from east_dataset import EASTDataset
 from dataset import SceneTextDataset
 from model import EAST
+
+# wandb 임포트
+import wandb
 
 def parse_args():
     parser = ArgumentParser()
@@ -35,7 +37,7 @@ def parse_args():
     # Early Stopping 인자 추가
     parser.add_argument('--early_stop', action='store_true', help='Early Stopping 활성화')
     parser.add_argument('--patience', type=int, default=10, help='개선이 없을 때 중단하기 전 기다릴 에포크 수')
-    parser.add_argument('--min_delta', type=float, default=0.0, help='개선으로 간주하기 위한 최소 변화량')
+    parser.add_argument('--min_delta', type=float, default=0.0001, help='개선으로 간주하기 위한 최소 변화량')
 
     args = parser.parse_args()
 
@@ -44,34 +46,75 @@ def parse_args():
 
     return args
 
-def create_datasets(root_dirs, image_size, input_size):
+def create_language_balanced_datasets(root_dirs, image_size, input_size, val_split):
+    # 모든 언어의 root_dirs를 한 번에 SceneTextDataset에 전달
     dataset = SceneTextDataset(
-        root_dirs=root_dirs,
+        root_dirs=root_dirs,  # 모든 언어의 데이터 디렉토리 전달
         split='train',
         image_size=image_size,
         crop_size=input_size
     )
     dataset = EASTDataset(dataset)
-    return dataset
+
+    # 언어별로 인덱스 수집
+    # SceneTextDataset이 언어 레이블을 제공한다고 가정
+    # 예: dataset.languages[i] = 'chinese', 'japanese', etc.
+    # 만약 그렇지 않다면, SceneTextDataset을 수정하여 언어 레이블을 제공하도록 해야 합니다.
+
+    if hasattr(dataset, 'languages'):
+        language_labels = dataset.languages  # 예시: 언어 레이블 리스트
+        from sklearn.model_selection import StratifiedShuffleSplit
+
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
+        train_idx, val_idx = next(sss.split(torch.arange(len(dataset)), language_labels))
+
+        train_dataset = Subset(dataset, train_idx)
+        val_dataset = Subset(dataset, val_idx)
+    else:
+        # SceneTextDataset이 언어 레이블을 제공하지 않는 경우, 랜덤 분할 수행
+        total_size = len(dataset)
+        val_size = int(total_size * val_split)
+        train_size = total_size - val_size
+
+        generator = torch.Generator().manual_seed(42)
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+
+    return train_dataset, val_dataset
 
 def do_training(root_dirs, model_dir, device, image_size, input_size, num_workers, batch_size,
-               learning_rate, max_epoch, save_interval, val_split, early_stop, patience, min_delta):
+               learning_rate, max_epoch, save_interval, val_split, early_stop, patience, min_delta,
+               wandb_project):
     # 재현성을 위한 시드 설정
     torch.manual_seed(42)
     random.seed(42)
 
-    # 데이터셋 생성
-    combined_dataset = create_datasets(root_dirs, image_size, input_size)
-    total_size = len(combined_dataset)
-    val_size = int(total_size * val_split)
-    train_size = total_size - val_size
+    # wandb 초기화
+    wandb.init(project=wandb_project, config={
+        "model_dir": model_dir,
+        "device": device,
+        "num_workers": num_workers,
+        "image_size": image_size,
+        "input_size": input_size,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "max_epoch": max_epoch,
+        "save_interval": save_interval,
+        "val_split": val_split,
+        "early_stop": early_stop,
+        "patience": patience,
+        "min_delta": min_delta
+    })
+    config = wandb.config
 
-    # 학습 및 검증 세트로 분할
-    train_dataset, val_dataset = random_split(combined_dataset, [train_size, val_size])
+    # 데이터셋 생성 및 언어별 균등 분할
+    train_dataset, val_dataset = create_language_balanced_datasets(root_dirs, image_size, input_size, val_split)
 
-    print(f'전체 데이터셋 크기: {total_size}')
-    print(f'학습 세트 크기: {train_size}')
-    print(f'검증 세트 크기: {val_size}')
+    total_train_size = len(train_dataset)
+    total_val_size = len(val_dataset)
+
+    print(f'전체 데이터셋 크기: {total_train_size + total_val_size}')
+    print(f'학습 세트 크기: {total_train_size}')
+    print(f'검증 세트 크기: {total_val_size}')
 
     train_loader = DataLoader(
         train_dataset,
@@ -134,6 +177,9 @@ def do_training(root_dirs, model_dir, device, image_size, input_size, num_worker
         elapsed_time = timedelta(seconds=time.time() - epoch_start)
         print(f'에포크 {epoch+1} | 학습 손실: {avg_train_loss:.4f} | 소요 시간: {elapsed_time}')
 
+        # wandb에 학습 손실 기록
+        wandb.log({"epoch": epoch+1, "train_loss": avg_train_loss})
+
         # 검증 단계
         model.eval()
         val_loss = 0.0
@@ -154,6 +200,9 @@ def do_training(root_dirs, model_dir, device, image_size, input_size, num_worker
         avg_val_loss = val_loss / len(val_loader)
         print(f'에포크 {epoch+1} | 검증 손실: {avg_val_loss:.4f}')
 
+        # wandb에 검증 손실 기록
+        wandb.log({"epoch": epoch+1, "val_loss": avg_val_loss})
+
         # Early Stopping 로직
         if early_stop:
             if avg_val_loss + min_delta < best_val_loss:
@@ -165,6 +214,8 @@ def do_training(root_dirs, model_dir, device, image_size, input_size, num_worker
                 best_ckpt_fpath = osp.join(model_dir, 'best_model.pth')
                 torch.save(model.state_dict(), best_ckpt_fpath)
                 print(f'최적 모델이 저장되었습니다. 검증 손실: {best_val_loss:.4f}')
+                # wandb에 모델 저장
+                wandb.save(best_ckpt_fpath)
             else:
                 epochs_no_improve += 1
                 print(f'검증 손실이 {epochs_no_improve} 에포크 동안 개선되지 않았습니다.')
@@ -183,6 +234,8 @@ def do_training(root_dirs, model_dir, device, image_size, input_size, num_worker
             latest_ckpt_fpath = osp.join(model_dir, f'epoch_{epoch+1}.pth')
             torch.save(model.state_dict(), latest_ckpt_fpath)
             print(f'{epoch+1} 에포크에서 체크포인트가 저장되었습니다.')
+            # wandb에 최신 모델 저장
+            wandb.save(latest_ckpt_fpath)
 
     print('학습이 완료되었습니다.')
 
@@ -194,6 +247,9 @@ def main(args):
         '/data/ephemeral/home/code/data/',
         '/data/ephemeral/home/code/data/'
     ]
+
+    # wandb 프로젝트 이름을 코드 내에서 직접 설정
+    wandb_project = "data_centric"  # 실제 W&B 프로젝트 이름으로 변경
 
     do_training(
         root_dirs=root_dirs,
@@ -209,7 +265,8 @@ def main(args):
         val_split=args.val_split,
         early_stop=args.early_stop,
         patience=args.patience,
-        min_delta=args.min_delta
+        min_delta=args.min_delta,
+        wandb_project=wandb_project
     )
 
 if __name__ == '__main__':
