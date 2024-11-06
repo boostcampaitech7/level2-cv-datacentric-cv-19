@@ -335,28 +335,23 @@ def filter_vertices(vertices, labels, ignore_under=0, drop_under=0):
 
 
 class SceneTextDataset(Dataset):
-    def __init__(self, root_dir,
-                 split='train',
-                 image_size=2048,
-                 crop_size=1024,
-                 ignore_under_threshold=10,
-                 drop_under_threshold=1,
-                 color_jitter=True,
-                 normalize=True):
+    def __init__(self, root_dirs, split='train', image_size=2048, crop_size=1024,
+                 ignore_under_threshold=10, drop_under_threshold=1,
+                 color_jitter=True, normalize=True):
         self._lang_list = ['chinese', 'japanese', 'thai', 'vietnamese']
-        self.root_dir = root_dir
+        if len(root_dirs) != len(self._lang_list):
+            raise ValueError(f'Expected {len(self._lang_list)} root_dirs, but got {len(root_dirs)}')
+
+        self.root_dirs = root_dirs
         self.split = split
         total_anno = dict(images=dict())
-        for nation in self._lang_list:
-            with open(osp.join(root_dir, '{}_receipt/ufo/{}.json'.format(nation, split)), 'r', encoding='utf-8') as f:
+
+        for root_dir, lang in zip(self.root_dirs, self._lang_list):
+            json_path = osp.join(root_dir, f'{lang}_receipt/ufo/{split}.json')
+            with open(json_path, 'r', encoding='utf-8') as f:
                 anno = json.load(f)
             for im in anno['images']:
-                total_anno['images'][im] = {"paragraphs": anno['images'][im]["paragraphs"], "words": {}}
-                for word_id, word_data in anno['images'][im]["words"].items():
-                    if word_data["transcription"]!="null" and word_data["transcription"]!="":
-                        total_anno['images'][im]["words"][word_id] = word_data
-            #for im in anno['images']:
-            #    total_anno['images'][im] = anno['images'][im]
+                total_anno['images'][im] = anno['images'][im]
 
         self.anno = total_anno
         self.image_fnames = sorted(self.anno['images'].keys())
@@ -366,6 +361,9 @@ class SceneTextDataset(Dataset):
 
         self.drop_under_threshold = drop_under_threshold
         self.ignore_under_threshold = ignore_under_threshold
+
+        # 증강 파이프라인 정의
+        self.augmentations = self._get_augmentations()
 
     def _infer_dir(self, fname):
         lang_indicator = fname.split('.')[1]
@@ -378,8 +376,46 @@ class SceneTextDataset(Dataset):
         elif lang_indicator == 'vi':
             lang = 'vietnamese'
         else:
-            raise ValueError
-        return osp.join(self.root_dir, f'{lang}_receipt', 'img', self.split)
+            raise ValueError(f"알 수 없는 언어 지시자: {lang_indicator}")
+
+        lang_index = self._lang_list.index(lang)
+        root_dir = self.root_dirs[lang_index]
+        return osp.join(root_dir, f'{lang}_receipt', 'img', self.split)
+
+    def _get_augmentations(self):
+        """점선 탐지를 위한 맞춤형 증강 파이프라인 정의."""
+        aug_list = []
+        
+        if self.color_jitter:
+            # 점선을 흐려지거나 너무 강하게 만들지 않도록 명도와 대비를 제한적으로 조절
+            aug_list.append(A.RandomBrightnessContrast(
+                brightness_limit=0.2, contrast_limit=0.2, p=0.5
+            ))
+        
+        if self.normalize:
+            # 표준 평균과 표준 편차로 정규화
+            aug_list.append(A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)))
+
+        # 현실적인 조건을 시뮬레이션하기 위해 미세한 노이즈 추가
+        aug_list.append(A.GaussNoise(var_limit=(10.0, 50.0), p=0.3))
+        
+        # 점선을 강조하기 위한 형태학적 변환 적용
+        aug_list.append(A.Lambda(image=self._apply_morphological_ops))
+
+        # 모든 증강을 컴포즈
+        return A.Compose(aug_list)
+
+    def _apply_morphological_ops(self, image, **kwargs):
+        """형태학적 연산을 적용하여 점선을 강조."""
+        # 그레이스케일로 변환
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        # 점선을 더 뚜렷하게 만들기 위해 팽창 적용
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(gray, kernel, iterations=1)
+        # 다시 RGB로 변환
+        enhanced = cv2.cvtColor(dilated, cv2.COLOR_GRAY2RGB)
+        return enhanced
+
     def __len__(self):
         return len(self.image_fnames)
 
@@ -393,9 +429,11 @@ class SceneTextDataset(Dataset):
             if num_pts > 4:
                 continue
             vertices.append(np.array(word_info['points']).flatten())
-            labels.append(1)
+            labels.append(1)  # 모든 주석은 점선으로 간주
+
         vertices, labels = np.array(vertices, dtype=np.float32), np.array(labels, dtype=np.int64)
 
+        # 필터링 함수가 정의되어 있어야 합니다.
         vertices, labels = filter_vertices(
             vertices,
             labels,
@@ -403,25 +441,67 @@ class SceneTextDataset(Dataset):
             drop_under=self.drop_under_threshold
         )
 
-        image = Image.open(image_fpath)
+        image = Image.open(image_fpath).convert('RGB')  # RGB로 변환 보장
         image, vertices = resize_img(image, vertices, self.image_size)
-        image, vertices = adjust_height(image, vertices)
-        image, vertices = rotate_img(image, vertices)
+        image, vertices = adjust_height(image, vertices, ratio=0.2)  # 높이 조정 범위 제한
+        image, vertices = rotate_img(image, vertices, angle_range=10)  # 회전 범위 제한
+
         image, vertices = crop_img(image, vertices, labels, self.crop_size)
 
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
         image = np.array(image)
 
-        funcs = []
-        if self.color_jitter:
-            funcs.append(A.ColorJitter())
-        if self.normalize:
-            funcs.append(A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)))
-        transform = A.Compose(funcs)
+        # 증강 적용
+        augmented = self.augmentations(image=image)
+        image = augmented['image']
 
-        image = transform(image=image)['image']
-        word_bboxes = np.reshape(vertices, (-1, 4, 2))
+        # 바운딩 박스를 (n, 4, 2) 형태로 재구성
+        word_bboxes = vertices.reshape(-1, 4, 2)
+
+        # ROI 마스크 생성
         roi_mask = generate_roi_mask(image, vertices, labels)
 
         return image, word_bboxes, roi_mask
+
+    def adjust_height(self, img, vertices, ratio=0.2):
+        '''이미지의 높이를 조정하여 데이터 증강
+        Input:
+            img         : PIL Image
+            vertices    : 텍스트 영역의 정점들 <numpy.ndarray, (n,8)>
+            ratio       : 높이 변경 범위 [0.92, 1.08]
+        Output:
+            img         : 조정된 PIL Image
+            new_vertices: 조정된 정점들
+        '''
+        # 왜곡을 최소화하도록 비율 제한
+        ratio_h = 1 + ratio * (np.random.rand() * 0.4 - 0.2)  # 비율을 [0.92, 1.08]로 제한
+        old_h = img.height
+        new_h = int(np.around(old_h * ratio_h))
+        img = img.resize((img.width, new_h), Image.BILINEAR)
+
+        new_vertices = vertices.copy()
+        if vertices.size > 0:
+            new_vertices[:, [1, 3, 5, 7]] = vertices[:, [1, 3, 5, 7]] * (new_h / old_h)
+        return img, new_vertices
+
+    def rotate_img(self, img, vertices, angle_range=10):
+        '''이미지를 회전하여 데이터 증강
+        Input:
+            img         : PIL Image
+            vertices    : 텍스트 영역의 정점들 <numpy.ndarray, (n,8)>
+            angle_range : 회전 범위
+        Output:
+            img         : 회전된 PIL Image
+            new_vertices: 회전된 정점들
+        '''
+        center_x = (img.width - 1) / 2
+        center_y = (img.height - 1) / 2
+        angle = angle_range * (np.random.rand() * 2 - 1)  # [-10, 10] 범위 내 랜덤 회전
+        img = img.rotate(angle, Image.BILINEAR, expand=False)  # 이미지 크기 변경 방지
+        new_vertices = np.zeros(vertices.shape)
+        for i, vertice in enumerate(vertices):
+            new_vertices[i, :] = rotate_vertices(
+                vertice,
+                -angle / 180 * math.pi,
+                anchor=np.array([[center_x], [center_y]])
+            )
+        return img, new_vertices
