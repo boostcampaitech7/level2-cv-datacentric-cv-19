@@ -333,7 +333,6 @@ def filter_vertices(vertices, labels, ignore_under=0, drop_under=0):
 
     return new_vertices, new_labels
 
-
 class SceneTextDataset(Dataset):
     def __init__(self, root_dir,
                  split='train',
@@ -342,7 +341,8 @@ class SceneTextDataset(Dataset):
                  ignore_under_threshold=10,
                  drop_under_threshold=1,
                  color_jitter=True,
-                 normalize=True):
+                 normalize=True,
+                 use_adaptive_threshold=False):
         self._lang_list = ['chinese', 'japanese', 'thai', 'vietnamese']
         self.root_dir = root_dir
         self.split = split
@@ -351,12 +351,7 @@ class SceneTextDataset(Dataset):
             with open(osp.join(root_dir, '{}_receipt/ufo/{}.json'.format(nation, split)), 'r', encoding='utf-8') as f:
                 anno = json.load(f)
             for im in anno['images']:
-                total_anno['images'][im] = {"paragraphs": anno['images'][im]["paragraphs"], "words": {}}
-                for word_id, word_data in anno['images'][im]["words"].items():
-                    if word_data["transcription"]!="null" and word_data["transcription"]!="":
-                        total_anno['images'][im]["words"][word_id] = word_data
-            #for im in anno['images']:
-            #    total_anno['images'][im] = anno['images'][im]
+                total_anno['images'][im] = anno['images'][im]
 
         self.anno = total_anno
         self.image_fnames = sorted(self.anno['images'].keys())
@@ -366,22 +361,7 @@ class SceneTextDataset(Dataset):
 
         self.drop_under_threshold = drop_under_threshold
         self.ignore_under_threshold = ignore_under_threshold
-
-    def _infer_dir(self, fname):
-        lang_indicator = fname.split('.')[1]
-        if lang_indicator == 'zh':
-            lang = 'chinese'
-        elif lang_indicator == 'ja':
-            lang = 'japanese'
-        elif lang_indicator == 'th':
-            lang = 'thai'
-        elif lang_indicator == 'vi':
-            lang = 'vietnamese'
-        else:
-            raise ValueError
-        return osp.join(self.root_dir, f'{lang}_receipt', 'img', self.split)
-    def __len__(self):
-        return len(self.image_fnames)
+        self.use_adaptive_threshold = use_adaptive_threshold  # 추가된 부분
 
     def __getitem__(self, idx):
         image_fname = self.image_fnames[idx]
@@ -403,16 +383,28 @@ class SceneTextDataset(Dataset):
             drop_under=self.drop_under_threshold
         )
 
+        # Load the image and preprocess
         image = Image.open(image_fpath)
         image, vertices = resize_img(image, vertices, self.image_size)
         image, vertices = adjust_height(image, vertices)
         image, vertices = rotate_img(image, vertices)
         image, vertices = crop_img(image, vertices, labels, self.crop_size)
 
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        image = np.array(image)
+        # Convert image to grayscale
+        image = image.convert('L')  # Convert to grayscale
+        image = np.array(image)     # Convert to numpy array
 
+        # Adaptive threshold 적용 여부를 체크
+        if self.use_adaptive_threshold:
+            image = cv2.adaptiveThreshold(
+                image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 10
+            )
+
+        # Add a channel dimension to match the original shape
+        image = np.expand_dims(image, axis=-1)  # Shape: (H, W, 1)
+        image = np.repeat(image, 3, axis=-1)    # Shape: (H, W, 3)
+
+        # Apply additional transformations if needed
         funcs = []
         if self.color_jitter:
             funcs.append(A.ColorJitter())
