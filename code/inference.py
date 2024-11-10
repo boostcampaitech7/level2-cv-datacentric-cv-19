@@ -12,6 +12,9 @@ from tqdm import tqdm
 
 from detect import detect
 
+# 추가된 라이브러리
+from PIL import Image, ImageOps
+import numpy as np
 
 CHECKPOINT_EXTENSIONS = ['.pth', '.ckpt']
 LANGUAGE_LIST = ['chinese', 'japanese', 'thai', 'vietnamese']
@@ -35,7 +38,6 @@ def parse_args():
 
     return args
 
-
 def do_inference(model, ckpt_fpath, data_dir, input_size, batch_size, split='test'):
     model.load_state_dict(torch.load(ckpt_fpath, map_location='cpu'))
     model.eval()
@@ -47,7 +49,14 @@ def do_inference(model, ckpt_fpath, data_dir, input_size, batch_size, split='tes
     for image_fpath in tqdm(sum([glob(osp.join(data_dir, f'{lang}_receipt/img/{split}/*')) for lang in LANGUAGE_LIST], [])):
         image_fnames.append(osp.basename(image_fpath))
 
-        images.append(cv2.imread(image_fpath)[:, :, ::-1])
+        # 이미지 로드 수정 부분 시작
+        # OpenCV 대신 PIL을 사용하여 EXIF 회전 정보를 적용
+        img = Image.open(image_fpath).convert('RGB')
+        img = ImageOps.exif_transpose(img)
+        img = np.array(img)
+        images.append(img)
+        # 이미지 로드 수정 부분 끝
+
         if len(images) == batch_size:
             by_sample_bboxes.extend(detect(model, images, input_size))
             images = []
@@ -62,13 +71,12 @@ def do_inference(model, ckpt_fpath, data_dir, input_size, batch_size, split='tes
 
     return ufo_result
 
-
 def main(args):
     # Initialize model
     model = EAST(pretrained=False).to(args.device)
 
     # Get paths to checkpoint files
-    ckpt_fpath = osp.join(args.model_dir, 'latest.pth')
+    ckpt_fpath = osp.join(args.model_dir, 'latest130에폭인데0.7481.pth')
 
     if not osp.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -83,7 +91,6 @@ def main(args):
     output_fname = 'output.csv'
     with open(osp.join(args.output_dir, output_fname), 'w') as f:
         json.dump(ufo_result, f, indent=4)
-
 
 if __name__ == '__main__':
     args = parse_args()

@@ -17,15 +17,21 @@ nation_dict = {
     'ja': 'japanese_receipt',
 }
 
-def save_vis_to_img(save_dir: str | os.PathLike, inference_dir: str | os.PathLike = '/data/ephemeral/home/code/predictions/output.csv') -> None:
+from PIL import Image, ImageDraw, ImageOps
+
+def save_vis_to_img(save_dir: str | os.PathLike, inference_dir: str | os.PathLike = '/data/ephemeral/home/code/ensemble_results/merged_result.csv') -> None:
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)    
     data = read_json(inference_dir)
     for im, points in data['images'].items():
         # change to 'train' for train dataset 
         im_path = Path('data') / nation_dict[im.split('.')[1]] / 'img' / 'test' / im
+        
+        # EXIF 회전 정보를 적용하여 이미지 로드
         img = Image.open(im_path).convert("RGB")
+        img = ImageOps.exif_transpose(img)  # EXIF 회전 정보 적용
         draw = ImageDraw.Draw(img)
+        
         for obj_k, obj_v in points['words'].items():
             # bbox points
             pts = [(int(p[0]), int(p[1])) for p in obj_v['points']]
